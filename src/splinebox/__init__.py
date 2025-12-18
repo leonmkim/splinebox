@@ -10,6 +10,9 @@ __all__ = [
     'jax_spline_curves',
 ]
 
+import jax
+jax.config.update("jax_default_matmul_precision", "float32")
+# jax.config.update("jax_enable_x64", True)
 from .basis_functions import *
 from .spline_curves import *
 from .jax_basis_functions import *
