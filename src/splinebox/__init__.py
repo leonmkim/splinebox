@@ -6,7 +6,11 @@ except ImportError:
 __all__ = [
     'basis_functions',
     'spline_curves'
+    'jax_basis_functions',
+    'jax_spline_curves',
 ]
 
 from .basis_functions import *
 from .spline_curves import *
+from .jax_basis_functions import *
+from .jax_spline_curves import *
