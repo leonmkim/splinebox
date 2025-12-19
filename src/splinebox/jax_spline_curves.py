@@ -8,10 +8,12 @@ from functools import partial
 import collections
 import json
 import copy
+from jax.tree_util import register_pytree_node_class
 
 from quadax import quadgk # gauss-kronrod integration in JAX, same used by scipy.integrate.quad
-from splinebox.jax_basis_functions import JaxBasisFunction, JaxB3
+from splinebox.jax_basis_functions import JaxBasisFunction, JaxB3, basis_function_from_name
 #%%
+
 # --- JIT-compiled Core Functions ---
 
 @jax.jit
@@ -492,8 +494,9 @@ def _2d_normal_helper(d1):
     normals = jnp.stack([-d1[:, 1], d1[:, 0]], axis=1)
     normals = normals / jnp.linalg.norm(normals, axis=1, keepdims=True)
     return normals
-# --- Main Class ---
 
+# --- Main Class ---
+@register_pytree_node_class
 class JaxSpline:
     """
     JAX-compatible Spline class.
@@ -506,7 +509,14 @@ class JaxSpline:
     _no_control_points_msg = "This spline object doesn't have any control points yet."
     _unimplemented_msg = "This function is not implemented."
 
-    def __init__(self, M: int, basis_function: JaxBasisFunction, closed=True, control_points=None, padding_function=_padding_function_jit):
+    def __init__(self, 
+                 M: int, 
+                 basis_function: JaxBasisFunction, 
+                # basis_function_name: str,
+                 closed=True, 
+                 control_points=None, 
+                 padding_function=_padding_function_jit):
+        # basis_function = JaxB3()
         if basis_function.support <= M:
             self.M = M
         else:
@@ -522,12 +532,31 @@ class JaxSpline:
         # JAX arrays preferred
         self._control_points = control_points
         if control_points is not None:
-            if not isinstance(control_points, jnp.ndarray):
+            # if not isinstance(control_points, jnp.ndarray):
+            if isinstance(control_points, (list, tuple, np.ndarray)):
                 control_points = jnp.array(control_points)
             
             self._control_points = control_points
             
         self.padding_function = padding_function
+
+    # #####################################
+    # Make the class a custom pytree so we can jit class methods. 
+    # See https://docs.jax.dev/en/latest/faq.html#strategy-3-making-customclass-a-pytree
+    # #####################################
+    def tree_flatten(self):
+        children = (self.control_points,) # arrays / dynamic values
+        aux_data = dict( # static values
+            M=self.M,
+            basis_function_name=str(self.basis_function),
+            closed=self.closed,
+        )
+        return (children, aux_data)
+    
+    @classmethod
+    def tree_unflatten(cls, aux_data, children):
+        basis_function = basis_function_from_name(aux_data['basis_function_name'])
+        return cls(aux_data["M"], basis_function, aux_data["closed"], children[0])
 
     def _check_control_points(self):
         if self.control_points is None:
@@ -558,7 +587,7 @@ class JaxSpline:
     @control_points.setter
     def control_points(self, values):
         if values is not None:
-            if not isinstance(values, jnp.ndarray):
+            if isinstance(values, (list, tuple, np.ndarray)):
                 values = jnp.array(values)
             n = len(values)
             if self.closed and n != self.M:
@@ -937,6 +966,7 @@ class JaxSpline:
         
         self.control_points = _fit_spline_jit(basis_vals, points)
 
+    @partial(jax.jit, static_argnames=['stop', 'start'])
     def arc_length(self, stop=None, start=0, epsabs:float=0.0, epsrel:float=1e-3):
         """
         Computes arc length quadax gauss-konrod "quadgk" integration.
@@ -991,6 +1021,7 @@ class JaxSpline:
         """
         raise NotImplementedError(self._unimplemented_msg)
     
+    @jax.jit
     def curvilinear_reparametrization_energy(self, epsabs=1e-6, epsrel=1e-6):
         """
         Computes the energy used to enforce equal knot spacing.
@@ -1037,6 +1068,7 @@ class JaxSpline:
             epsabs, epsrel, 100,
         )
         
+    @jax.jit
     def curvature(self, t):
         """
         Compute JIT-compatible curvature.
@@ -1168,6 +1200,7 @@ class JaxSpline:
         if centered:
             self.translate(centroid)
 
+    @partial(jax.jit, static_argnames=("return_t",))
     def distance(self, points, return_t=False):
         """
         Computes distance using Gradient Descent/Newton methods in JAX 
@@ -1240,7 +1273,7 @@ class JaxSpline:
         if return_t:
             return min_dists, final_t
         return min_dists
-
+    
     def mesh(self, 
              radius=None, 
              step_t=0.1, 

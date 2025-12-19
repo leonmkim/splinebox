@@ -5,6 +5,7 @@ from jax import lax
 from jax import jit
 from jax import vmap
 from jax.numpy import vectorize
+from jax.tree_util import register_pytree_node_class
 import numpy as np
 
 import inspect
@@ -13,6 +14,7 @@ import warnings
 
 #%%
 
+@register_pytree_node_class
 class JaxBasisFunction:
     """
     JAX-compatible base class for basis functions.
@@ -22,6 +24,21 @@ class JaxBasisFunction:
     def __init__(self, multigenerator, support):
         self.multigenerator = multigenerator
         self.support = support
+
+    # #####################################
+    # Make the class a custom pytree so we can jit class methods. See https://docs.jax.dev/en/latest/faq.html#strategy-3-making-customclass-a-pytree
+    # #####################################
+    def tree_flatten(self):
+        children = None  # arrays / dynamic values
+        aux_data = dict( # static values
+            multigenerator=self.multigenerator,
+            support=self.support,
+        )  
+        return (children, aux_data)
+    
+    @classmethod
+    def tree_unflatten(cls, aux_data, children):
+        return cls(**aux_data)
 
     def __str__(self):
         return "BasisFunction"
@@ -66,13 +83,16 @@ class JaxBasisFunction:
     def refinement_mask(self):
         raise NotImplementedError(JaxBasisFunction._unimplemented_message)
 
-
 class JaxB3(JaxBasisFunction):
     """
     JAX implementation of the cubic B-spline basis function.
     """
     def __init__(self):
         super().__init__(False, 4)
+
+    @classmethod
+    def tree_unflatten(cls, aux_data, children):
+        return cls()
 
     def __str__(self):
         return "JaxB3"
