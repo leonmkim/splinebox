@@ -253,10 +253,13 @@ def _convert_to_array(t):
         raise ValueError("t must be 1D array-like.")
     return t, is_single
 
-@jax.jit
-def _compute_spline_first_deriv_jit_single_val(tval, control_points):
+@partial(jax.jit, static_argnames=['single_val'])
+def _compute_spline_first_deriv_jit(tval, control_points, single_val=False):
     basis_vals_d1 = JaxB3._derivative_1(tval)
-    return _eval_spline_jit(basis_vals_d1, control_points)
+    d1 = _eval_spline_jit(basis_vals_d1, control_points)
+    if single_val:
+        d1 = d1[0]
+    return d1
 
 @jax.jit
 def tangent_vector_to_speed(d1):
@@ -274,7 +277,7 @@ def _compute_curve_length_jit(
                             ):
     integral = quadgk(
         lambda t: tangent_vector_to_speed(
-            _compute_spline_first_deriv_jit_single_val(
+            _compute_spline_first_deriv_jit(
                 _get_tval_jit(jnp.atleast_1d(t), M, half_support, pad, closed), control_points,
             )
         ),
@@ -301,8 +304,8 @@ def _compute_curvilinear_reparametrization_energy_jit(
     integral = quadgk(
         lambda t: _curvilinear_integrand(
             tangent_vector_to_speed(
-                _compute_spline_first_deriv_jit_single_val(
-                    _get_tval_jit(jnp.atleast_1d(t), M, half_support, pad, closed), control_points,
+                _compute_spline_first_deriv_jit(
+                    _get_tval_jit(jnp.atleast_1d(t), M, half_support, pad, closed), control_points, single_val=True,
                 )
             ), c),
         [start, stop],
