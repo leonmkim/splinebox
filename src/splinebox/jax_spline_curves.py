@@ -14,490 +14,6 @@ from quadax import quadgk # gauss-kronrod integration in JAX, same used by scipy
 from splinebox.jax_basis_functions import JaxBasisFunction, JaxB3, basis_function_from_name
 #%%
 
-# --- JIT-compiled Core Functions ---
-
-@jax.jit
-def _padding_function_jit(knots, pad_length):
-    """JIT-able padding function."""
-    if knots.ndim == 1:
-        knots = knots[:, None]
-    # jnp.pad works identically to np.pad
-    return jnp.pad(knots, ((pad_length, pad_length), (0, 0)), mode="edge")
-
-@partial(jax.jit, static_argnames=['M', 'half_support', 'closed'])
-def _get_tval_jit(t, M, half_support, pad, closed):
-    """
-    Calculates the t-values relative to knot indices. 
-    Replaces _wrap_index logic with vectorized operations.
-    """
-    t = jnp.atleast_1d(t)
-    
-    if closed:
-        k = jnp.arange(M)
-        # We broadcast t against k to get a matrix (len(t), M)
-        # t is (N, 1), k is (1, M)
-        ts = t[:, None]
-        ks = k[None, :]
-        
-        # Logic from _wrap_index vectorized:
-        # Case 1: Close to end, wrapping to beginning
-        cond1 = ts >= (M + ks - half_support)
-        val1 = ts - M - ks
-        
-        # Case 2: Close to beginning, wrapping from end
-        cond2 = ts <= (half_support - (M - ks))
-        val2 = ts + M - ks
-        
-        # Case 3: Outside support
-        # Note: In JAX we usually don't use nan for "outside", strictly speaking,
-        # but if the basis function handles bounds checking, we can leave it or set to a dummy.
-        # Here we follow the logic:
-        cond3 = (ts > ks + half_support) | (ts < ks - half_support)
-        val3 = half_support + 1.0 # "outside_tvalue"
-        
-        # Case 4: Normal
-        val4 = ts - ks
-        
-        # Combine using select/where
-        # We check conditions in priority order
-        tval = jnp.select(
-            [cond1, cond2, cond3],
-            [val1, val2, val3],
-            default=val4
-        )
-        return tval
-    else:
-        raise NotImplementedError("Open splines are not implemented yet in JaxSpline.")
-        # Non-closed case is much simpler
-        k = jnp.arange(M + 2 * pad) - pad
-        return t[:, None] - k[None, :]
-
-@jax.jit
-def _eval_spline_jit(basis_vals, control_points):
-    """Pure JIT-able matrix multiplication for spline evaluation."""
-    return jnp.matmul(basis_vals, control_points)
-
-@jax.jit
-def _fit_spline_jit(basis_vals, points):
-    """Least squares fitting using JAX's linear algebra solver."""
-    return jnp.linalg.lstsq(basis_vals, points, rcond=None)[0]
-
-@jax.jit
-def _moving_frame_frenet(T, normal_approx):
-    '''
-    Docstring for _moving_frame_frenet
-    
-    :param T: normalized tangent vectors
-    :param normal_approx: second derivative vectors (not necessarily normalized)
-    
-    '''
-    # Binormal = T x N_approx
-    binormals = jnp.cross(T, normal_approx)
-    binormal_norms = jnp.linalg.norm(binormals, axis=-1, keepdims=True)
-    
-    binormal_normalized = binormals / binormal_norms
-    
-    normals = jnp.cross(binormal_normalized, T)
-    
-    frames = jnp.stack([T, normals, binormal_normalized], axis=1)
-    return frames, binormal_norms
-#%%
-@jax.jit
-def _moving_frame_bishop(T, initial_vector):
-    '''
-    Docstring for _moving_frame_bishop
-    
-    :param T: normalized tangent vectors
-    :param initial_vector: Description
-    '''
-    # Note: initial_vector must be provided here (handled in wrapper)
-    
-    # Ensure orthogonality of provided/calculated initial vector
-    t0_T = T[0]
-    initial_vector = initial_vector - t0_T * jnp.dot(t0_T, initial_vector)
-    initial_vector = initial_vector / (jnp.linalg.norm(initial_vector) + 1e-12)
-
-    # init_carry = (initial_vector, jnp.cross(t0_T, initial_vector), t0_T)
-    init_binormal = jnp.cross(t0_T, initial_vector)
-    init_carry = (t0_T, initial_vector, init_binormal) # tangent, normal, binormal
-
-    T_slice = T[1:]  # We start from the second tangent
-
-    def scan_body(prev_frame, curr_T):
-        prev_t, prev_n, prev_b = prev_frame # tangent, normal, binormal
-        
-        # Rotation axis
-        normal = jnp.cross(prev_t, curr_T)
-        normal_norm = jnp.linalg.norm(normal)
-        u = normal / (normal_norm + 1e-12)
-        
-        dot_T = jnp.dot(prev_t, curr_T)
-        
-        # Safe arccos
-        phi = jnp.arccos(jnp.clip(dot_T, -1.0, 1.0))
-        
-        def rotate_vec(vec):
-            # Safe division: if norm_axis is 0, we don't use this result anyway, 
-            # but we prevent NaNs in the graph with +1e-12
-            # u = normal / (normal_norm + 1e-12)
-            return (vec * jnp.cos(phi) + 
-                    jnp.cross(u, vec) * jnp.sin(phi) + 
-                    u * jnp.dot(u, vec) * (1 - jnp.cos(phi)))
-
-        # If tangents are parallel (norm_axis ~ 0), identity transform
-        new_n, new_b = lax.cond(
-            normal_norm > 1e-6,
-            lambda _: (rotate_vec(prev_n), rotate_vec(prev_b)),
-            lambda _: (prev_n, prev_b),
-            None
-        )
-        
-        # Re-orthogonalize to prevent drift
-        new_n = new_n - curr_T * jnp.dot(curr_T, new_n)
-        new_n = new_n / (jnp.linalg.norm(new_n) + 1e-12)
-        new_b = jnp.cross(curr_T, new_n)
-        
-        new_frame = jnp.stack([curr_T, new_n, new_b], axis=0)
-        return (new_n, new_b, curr_T), new_frame
-
-    _, frames = lax.scan(scan_body, init_carry, T_slice)
-    # stack initial_carry frame at beginning
-    init_frame = jnp.expand_dims(jnp.stack([t0_T, initial_vector, init_binormal], axis=0), axis=0)
-    final_frames = jnp.concatenate(
-        [init_frame, frames],
-        axis=0,
-    )
-    return final_frames
-#%%
-@jax.jit
-def _compute_pairwise_distances(points_a, points_b):
-    '''
-    Docstring for _compute_distances
-    
-    :param points_a: N_axdim array
-    :param points_b: N_bxdim array
-    :return: N_a x N_b array of distances
-    '''
-    return jnp.linalg.norm(points_a[:, None] - points_b[None], axis=-1)
-
-@jax.jit
-def _compute_closest_indices_between_points(curve_points, points):
-    '''
-    Docstring for _compute_closest_point_on_curve
-    
-    :param points: N_pxD array of points
-    :param curve_points: N_cxD array of curve points
-    :return: N_p array of indices of closest curve points
-    '''
-    dists = _compute_pairwise_distances(curve_points, points)
-    closest_indices = jnp.argmin(dists, axis=0)
-    return closest_indices
-
-#%%
-
-@jax.jit
-def _compute_control_point_centroid(control_points):
-    return jnp.mean(control_points, axis=0)
-
-@jax.jit
-def _compute_control_points_translated(control_points, vector):
-    return control_points + vector
-
-@jax.jit
-def _compute_control_points_scaled(control_points, scaling_factor):
-    centroid = _compute_control_point_centroid(control_points)
-    centered_control_points = _compute_control_points_translated(control_points, -centroid)
-    scaled_centered = centered_control_points * scaling_factor
-    return _compute_control_points_translated(scaled_centered, centroid)
-
-@jax.jit
-def _compute_control_points_rotated(control_points, rotation_matrix):
-    def rotate_point(rotation_matrix, control_point):
-        rotated_point = jnp.matmul(rotation_matrix, control_point)
-        return rotation_matrix, rotated_point
-        
-    _, rotated_control_points = jax.lax.scan(rotate_point, rotation_matrix, control_points)
-    return rotated_control_points
-    
-@jax.jit
-def _initial_vector_guess_jit(t0_T, guess, guess_is_degen):
-    # Estimate initial vector (same logic as before, just inline or separate helper)
-    def alternate_guess(t0_T):
-        guess_alt = jnp.zeros(3)
-        max_axis = jnp.argmax(jnp.abs(t0_T))
-        other_axis = (max_axis + 1) % 3
-        guess_alt = guess_alt.at[max_axis].set(t0_T[other_axis])
-        guess_alt = guess_alt.at[other_axis].set(-t0_T[max_axis])
-        return guess_alt
-    guess = lax.cond(
-        guess_is_degen,
-        lambda x: alternate_guess(x),
-        lambda _: guess,
-        t0_T
-    )
-    return guess / (jnp.linalg.norm(guess) + 1e-12)
-
-def _convert_to_array(t):
-    is_single = False
-    if isinstance(t, (int, float)):
-        t = jnp.array([t])
-        is_single = True
-    elif isinstance(t, (list, tuple)):
-        t = jnp.array(t)
-    elif hasattr(t, 'shape') and t.shape == ():
-        t = jnp.array([t])
-        is_single = True
-    elif not isinstance(t, jnp.ndarray):
-        t = jnp.array(t)
-    if t.ndim > 1:
-        raise ValueError("t must be 1D array-like.")
-    return t, is_single
-
-@partial(jax.jit, static_argnames=['single_val'])
-def _compute_spline_first_deriv_jit(tval, control_points, single_val=False):
-    basis_vals_d1 = JaxB3._derivative_1(tval)
-    d1 = _eval_spline_jit(basis_vals_d1, control_points)
-    if single_val:
-        d1 = d1[0]
-    return d1
-
-@jax.jit
-def tangent_vector_to_speed(d1):
-    """Helper function to compute differential length element."""
-    safe_d1 = jnp.nan_to_num(d1)
-    speed = jnp.linalg.norm(safe_d1, axis=-1)
-    return speed
-
-@partial(jax.jit, static_argnames=['M', 'half_support', 'closed', 'max_ninter'])
-def _compute_curve_length_jit(
-                            control_points, 
-                            M, half_support, pad, closed,
-                            start, stop, 
-                            epsabs, epsrel, max_ninter
-                            ):
-    integral = quadgk(
-        lambda t: tangent_vector_to_speed(
-            _compute_spline_first_deriv_jit(
-                _get_tval_jit(jnp.atleast_1d(t), M, half_support, pad, closed), control_points,
-            )
-        ),
-        [start, stop],
-        epsabs=epsabs,
-        epsrel=epsrel,
-        max_ninter=max_ninter,
-    )
-    return integral[0]
-
-@jax.jit
-def _curvilinear_integrand(speed, c):
-    return (speed**2 - c)**2
-
-@partial(jax.jit, static_argnames=['M', 'half_support', 'closed', 'max_ninter'])
-def _compute_curvilinear_reparametrization_energy_jit(
-                            L, 
-                            control_points, 
-                            M, half_support, pad, closed,
-                            start, stop, 
-                            epsabs, epsrel, max_ninter
-                            ):
-    c = (L/M)**2
-    integral = quadgk(
-        lambda t: _curvilinear_integrand(
-            tangent_vector_to_speed(
-                _compute_spline_first_deriv_jit(
-                    _get_tval_jit(jnp.atleast_1d(t), M, half_support, pad, closed), control_points, single_val=True,
-                )
-            ), c),
-        [start, stop],
-        epsabs=epsabs,
-        epsrel=epsrel,
-        max_ninter=max_ninter,
-    )
-    return integral[0] / (L**4)
-
-
-@partial(jax.jit, static_argnames=['M', 'half_support', 'closed'])
-def _compute_spline_val_jit_single_val(t, control_points, 
-                                       M, half_support, pad, closed
-                                       ):
-    t = jnp.atleast_1d(t)
-    tval = _get_tval_jit(t, M, half_support, pad, closed)
-    basis_vals = JaxB3._func(tval)
-    return _eval_spline_jit(basis_vals, control_points)
-
-@partial(jax.jit, static_argnames=['M', 'half_support', 'closed'])
-def _spline_distance_to_point_jit(t, point, control_points,
-                                M, half_support, pad, closed,
-                                ):
-    spline_point = _compute_spline_val_jit_single_val(t, control_points, M, half_support, pad, closed)
-    return jnp.sum((spline_point - point)**2)
-
-@partial(jax.jit, static_argnames=['M', 'half_support', 'closed'])
-@partial(jax.vmap, in_axes=(0, 0, None, None, None, None, None, None, None))
-def _projected_newton_step(t, point, 
-                           control_points, min_t_bound, max_t_bound, M, half_support, pad, closed
-                           ):
-    grad_fn = jax.grad(_spline_distance_to_point_jit, argnums=0) # only wrt t
-    hess_fn = jax.hessian(_spline_distance_to_point_jit, argnums=0) # only wrt t
-    grad = grad_fn(t, point, control_points, M, half_support, pad, closed)
-    hess = hess_fn(t, point, control_points, M, half_support, pad, closed)
-    # Newton step
-    step = -grad / (hess + 1e-12)
-    new_tval = t + step
-    # Projected to bounds
-    new_tval = jnp.clip(new_tval, min_t_bound, max_t_bound)
-    return new_tval
-
-@partial(jax.jit, static_argnames=['M', 'half_support', 'closed', 'max_iters'])
-def _find_closest_t_to_point_jit(
-    t_inits, points,
-    control_points,
-    M, half_support, pad, closed,
-    min_t_bound, max_t_bound,
-    max_iters
-    ):
-    def scan_body_fn(curr_ts, _):
-        t = _projected_newton_step(curr_ts, points, control_points, min_t_bound, max_t_bound,
-                                    M, half_support, pad, closed)
-        return t, None
-    t_final, _ = lax.scan(scan_body_fn, t_inits, None, length=max_iters)
-    return t_final
-
-#%%
-
-@partial(jax.jit, static_argnames=['closed'])
-def _generate_connectivity_jit(closed, n_angles, n_t, n_points):
-    raise NotImplementedError("Non-zero radius mesh not implemented yet.")
-    """
-    Generates mesh connectivity using broadcasting instead of loops.
-    Replaces the Numba functions.
-    """
-    # Create grid of indices (i, j)
-    # i goes from 0 to n_t-1 (or n_t if closed)
-    # j goes from 0 to n_angles-1
-    
-    limit_t = n_t if closed else n_t - 1
-    i_grid, j_grid = jnp.meshgrid(jnp.arange(limit_t), jnp.arange(n_angles), indexing='ij')
-    
-    # Flatten for processing
-    i = i_grid.flatten()
-    j = j_grid.flatten()
-    
-    # --- Surface Mesh (Triangles) ---
-    # Triangle 1: (i, j), ((i+1), j), ((i+1), (j+1))
-    p1 = i * n_angles + j
-    p2 = ((i + 1) * n_angles + j) % n_points
-    p3 = ((i + 1) * n_angles + (j + 1) % n_angles) % n_points
-    
-    # Triangle 2: (i, j), ((i+1), (j+1)), (i, (j+1))
-    p4 = i * n_angles + j
-    p5 = ((i + 1) * n_angles + (j + 1) % n_angles) % n_points
-    p6 = (i * n_angles + (j + 1) % n_angles) % n_points
-    
-    t1 = jnp.stack([p1, p2, p3], axis=1)
-    t2 = jnp.stack([p4, p5, p6], axis=1)
-    
-    # Interleave t1 and t2
-    surface_conn = jnp.empty((t1.shape[0] * 2, 3), dtype=jnp.int32)
-    surface_conn = surface_conn.at[0::2].set(t1)
-    surface_conn = surface_conn.at[1::2].set(t2)
-    
-    # --- Volume Mesh (Tetrahedra) ---
-    # Indices logic adapted from original code
-    # i * (n_angles + 1) + j ...
-    row_len = n_angles + 1
-    
-    # Recalculate p indices for volume (different stride)
-    v_p1 = i * row_len + j + 1 # offset j by 1 because j starts 0 here but 1 in original loop?
-    # Actually, let's stick to the logic: j goes 0..n_angles-1, mapped to 1..n_angles
-    jj = j + 1
-    
-    curr_row = i * row_len
-    next_row = (i + 1) * row_len
-    
-    # Tet 1
-    tp1 = curr_row + jj
-    tp2 = (next_row + jj) % n_points
-    tp3 = (next_row + 1 + (jj % n_angles)) % n_points
-    tp4 = (next_row) % n_points
-    
-    # Tet 2
-    tp5 = curr_row + jj
-    tp6 = (next_row + 1 + (jj % n_angles)) % n_points
-    tp7 = (curr_row + 1 + (jj % n_angles)) % n_points
-    tp8 = curr_row
-    
-    # Tet 3
-    tp9 = curr_row + jj
-    tp10 = (next_row + 1 + (jj % n_angles)) % n_points
-    tp11 = (next_row) % n_points
-    tp12 = curr_row
-    
-    # Stack
-    tet1 = jnp.stack([tp1, tp2, tp3, tp4], axis=1)
-    tet2 = jnp.stack([tp5, tp6, tp7, tp8], axis=1)
-    tet3 = jnp.stack([tp9, tp10, tp11, tp12], axis=1)
-    
-    vol_conn = jnp.empty((tet1.shape[0] * 3, 4), dtype=jnp.int32)
-    vol_conn = vol_conn.at[0::3].set(tet1)
-    vol_conn = vol_conn.at[1::3].set(tet2)
-    vol_conn = vol_conn.at[2::3].set(tet3)
-    
-    return surface_conn, vol_conn
-
-@partial(jax.jit, static_argnames=['self_ndim', 'single_val'])
-def _curvature(d1, d2, self_ndim, single_val):
-    # Handle 1D case (codomain dimension = 1)
-    # If ndim=1, we treat it as a graph y=f(x) where x=t.
-    # r(t) = [t, y(t)] -> r'(t) = [1, y'(t)], r''(t) = [0, y''(t)]
-    if self_ndim == 1:
-        # d1 is (N, 1) -> stack with ones -> (N, 2)
-        d1 = jnp.hstack([jnp.ones_like(d1), d1])
-        d2 = jnp.hstack([jnp.zeros_like(d2), d2])
-        
-    norm_d1 = jnp.linalg.norm(d1, axis=-1)
-    norm_d2 = jnp.linalg.norm(d2, axis=-1)
-    
-    # Compute numerator
-    # We need to distinguish 2D (signed) vs ND (unsigned)
-    
-    # Helper for 2D signed curvature: x'y'' - y'x''
-    def signed_2d_numerator(d1, d2):
-        # return d1[:, 0] * d2[:, 1] - d1[:, 1] * d2[:, 0]
-        return d1[:, 1] * d2[:, 0] - d1[:, 0] * d2[:, 1]
-
-    # Helper for ND unsigned curvature: sqrt(|d1|^2|d2|^2 - (d1.d2)^2)
-    def unsigned_nd_numerator(d1, d2, norm_d1, norm_d2):
-        dot = jnp.sum(d1 * d2, axis=-1)
-        # Clip to 0 to avoid sqrt(-eps) errors
-        val = norm_d1**2 * norm_d2**2 - dot**2
-        return jnp.sqrt(jnp.maximum(val, 0.0))
-
-    # Check dimension (using shape of d1 which handles the 1D->2D promotion)
-    dim = d1.shape[-1]
-    
-    numerator = lax.cond(
-        dim == 2,
-        lambda _: signed_2d_numerator(d1, d2),
-        lambda _: unsigned_nd_numerator(d1, d2, norm_d1, norm_d2),
-        None
-    )
-    
-    # Avoid division by zero if velocity is zero
-    denom = norm_d1 ** 3
-    k = jnp.where(denom > 1e-12, numerator / denom, 0.0)
-    
-    if single_val:
-        return k[0]
-    return k
-
-@jax.jit
-def _2d_normal_helper(d1):
-    # Rotate 90 degrees: [x, y] -> [-y, x]
-    normals = jnp.stack([-d1[:, 1], d1[:, 0]], axis=1)
-    normals = normals / jnp.linalg.norm(normals, axis=1, keepdims=True)
-    return normals
-
 # --- Main Class ---
 @register_pytree_node_class
 class JaxSpline:
@@ -518,7 +34,7 @@ class JaxSpline:
                 # basis_function_name: str,
                  closed=True, 
                  control_points=None, 
-                 padding_function=_padding_function_jit):
+                 padding_function=None):
         # basis_function = JaxB3()
         if basis_function.support <= M:
             self.M = M
@@ -540,13 +56,517 @@ class JaxSpline:
                 control_points = jnp.array(control_points)
             
             self._control_points = control_points
-            
+        
+        if padding_function is None:
+            padding_function = self._padding_function
         self.padding_function = padding_function
 
     # #####################################
-    # Make the class a custom pytree so we can jit class methods. 
-    # See https://docs.jax.dev/en/latest/faq.html#strategy-3-making-customclass-a-pytree
+    # Static JIT-compiled methods
     # #####################################
+
+    @staticmethod
+    @jax.jit
+    def _padding_function(knots, pad_length):
+        """JIT-able padding function."""
+        if knots.ndim == 1:
+            knots = knots[:, None]
+        # jnp.pad works identically to np.pad
+        return jnp.pad(knots, ((pad_length, pad_length), (0, 0)), mode="edge")
+
+    @staticmethod
+    @partial(jax.jit, static_argnames=['M', 'half_support', 'closed'])
+    def _get_tval(t, M, half_support, pad, closed):
+        """
+        Calculates the t-values relative to knot indices. 
+        Replaces _wrap_index logic with vectorized operations.
+        """
+        t = jnp.atleast_1d(t)
+        
+        if closed:
+            k = jnp.arange(M)
+            # We broadcast t against k to get a matrix (len(t), M)
+            # t is (N, 1), k is (1, M)
+            ts = t[:, None]
+            ks = k[None, :]
+            
+            # Logic from _wrap_index vectorized:
+            # Case 1: Close to end, wrapping to beginning
+            cond1 = ts >= (M + ks - half_support)
+            val1 = ts - M - ks
+            
+            # Case 2: Close to beginning, wrapping from end
+            cond2 = ts <= (half_support - (M - ks))
+            val2 = ts + M - ks
+            
+            # Case 3: Outside support
+            # Note: In JAX we usually don't use nan for "outside", strictly speaking,
+            # but if the basis function handles bounds checking, we can leave it or set to a dummy.
+            # Here we follow the logic:
+            cond3 = (ts > ks + half_support) | (ts < ks - half_support)
+            val3 = half_support + 1.0 # "outside_tvalue"
+            
+            # Case 4: Normal
+            val4 = ts - ks
+            
+            # Combine using select/where
+            # We check conditions in priority order
+            tval = jnp.select(
+                [cond1, cond2, cond3],
+                [val1, val2, val3],
+                default=val4
+            )
+            return tval
+        else:
+            raise NotImplementedError("Open splines are not implemented yet in JaxSpline.")
+            # Non-closed case is much simpler
+            k = jnp.arange(M + 2 * pad) - pad
+            return t[:, None] - k[None, :]
+
+    @staticmethod
+    @jax.jit
+    def _eval_spline(basis_vals, control_points):
+        """Pure JIT-able matrix multiplication for spline evaluation."""
+        return jnp.matmul(basis_vals, control_points)
+
+    @staticmethod
+    @jax.jit
+    def _fit_spline(basis_vals, points):
+        """Least squares fitting using JAX's linear algebra solver."""
+        return jnp.linalg.lstsq(basis_vals, points, rcond=None)[0]
+
+    @staticmethod
+    @jax.jit
+    def _moving_frame_frenet(T, normal_approx):
+        '''
+        Docstring for _moving_frame_frenet
+        
+        :param T: normalized tangent vectors
+        :param normal_approx: second derivative vectors (not necessarily normalized)
+        
+        '''
+        # Binormal = T x N_approx
+        binormals = jnp.cross(T, normal_approx)
+        binormal_norms = jnp.linalg.norm(binormals, axis=-1, keepdims=True)
+        
+        binormal_normalized = binormals / binormal_norms
+        
+        normals = jnp.cross(binormal_normalized, T)
+        
+        frames = jnp.stack([T, normals, binormal_normalized], axis=1)
+        return frames, binormal_norms
+
+    @staticmethod
+    @jax.jit
+    def _moving_frame_bishop(T, initial_vector):
+        '''
+        Docstring for _moving_frame_bishop
+        
+        :param T: normalized tangent vectors
+        :param initial_vector: Description
+        '''
+        # Ensure orthogonality of provided/calculated initial vector
+        t0_T = T[0]
+        initial_vector = initial_vector - t0_T * jnp.dot(t0_T, initial_vector)
+        initial_vector = initial_vector / (jnp.linalg.norm(initial_vector) + 1e-12)
+
+        init_binormal = jnp.cross(t0_T, initial_vector)
+        init_carry = (t0_T, initial_vector, init_binormal) # tangent, normal, binormal
+
+        T_slice = T[1:]  # We start from the second tangent
+
+        def scan_body(prev_frame, curr_T):
+            prev_t, prev_n, prev_b = prev_frame # tangent, normal, binormal
+            
+            # Rotation axis
+            normal = jnp.cross(prev_t, curr_T)
+            normal_norm = jnp.linalg.norm(normal)
+            u = normal / (normal_norm + 1e-12)
+            
+            dot_T = jnp.dot(prev_t, curr_T)
+            
+            # Safe arccos
+            phi = jnp.arccos(jnp.clip(dot_T, -1.0, 1.0))
+            
+            def rotate_vec(vec):
+                # Safe division: if norm_axis is 0, we don't use this result anyway, 
+                # but we prevent NaNs in the graph with +1e-12
+                # u = normal / (normal_norm + 1e-12)
+                return (vec * jnp.cos(phi) + 
+                        jnp.cross(u, vec) * jnp.sin(phi) + 
+                        u * jnp.dot(u, vec) * (1 - jnp.cos(phi)))
+
+            # If tangents are parallel (norm_axis ~ 0), identity transform
+            new_n, new_b = lax.cond(
+                normal_norm > 1e-6,
+                lambda _: (rotate_vec(prev_n), rotate_vec(prev_b)),
+                lambda _: (prev_n, prev_b),
+                None
+            )
+            
+            # Re-orthogonalize to prevent drift
+            new_n = new_n - curr_T * jnp.dot(curr_T, new_n)
+            new_n = new_n / (jnp.linalg.norm(new_n) + 1e-12)
+            new_b = jnp.cross(curr_T, new_n)
+            
+            new_frame = jnp.stack([curr_T, new_n, new_b], axis=0)
+            return (new_n, new_b, curr_T), new_frame
+
+        _, frames = lax.scan(scan_body, init_carry, T_slice)
+        # stack initial_carry frame at beginning
+        init_frame = jnp.expand_dims(jnp.stack([t0_T, initial_vector, init_binormal], axis=0), axis=0)
+        final_frames = jnp.concatenate(
+            [init_frame, frames],
+            axis=0,
+        )
+        return final_frames
+
+    @staticmethod
+    @jax.jit
+    def _compute_pairwise_distances(points_a, points_b):
+        '''
+        Docstring for _compute_distances
+        
+        :param points_a: N_axdim array
+        :param points_b: N_bxdim array
+        :return: N_a x N_b array of distances
+        '''
+        return jnp.linalg.norm(points_a[:, None] - points_b[None], axis=-1)
+
+    @staticmethod
+    @jax.jit
+    def _compute_closest_indices_between_points(curve_points, points):
+        '''
+        Docstring for _compute_closest_point_on_curve
+        
+        :param points: N_pxD array of points
+        :param curve_points: N_cxD array of curve points
+        :return: N_p array of indices of closest curve points
+        '''
+        dists = JaxSpline._compute_pairwise_distances(curve_points, points)
+        closest_indices = jnp.argmin(dists, axis=0)
+        return closest_indices
+
+    @staticmethod
+    @jax.jit
+    def _compute_control_point_centroid(control_points):
+        return jnp.mean(control_points, axis=0)
+
+    @staticmethod
+    @jax.jit
+    def _compute_control_points_translated(control_points, vector):
+        return control_points + vector
+
+    @staticmethod
+    @jax.jit
+    def _compute_control_points_scaled(control_points, scaling_factor):
+        centroid = JaxSpline._compute_control_point_centroid(control_points)
+        centered_control_points = JaxSpline._compute_control_points_translated(control_points, -centroid)
+        scaled_centered = centered_control_points * scaling_factor
+        return JaxSpline._compute_control_points_translated(scaled_centered, centroid)
+
+    @staticmethod
+    @jax.jit
+    def _compute_control_points_rotated(control_points, rotation_matrix):
+        def rotate_point(rotation_matrix, control_point):
+            rotated_point = jnp.matmul(rotation_matrix, control_point)
+            return rotation_matrix, rotated_point
+            
+        _, rotated_control_points = jax.lax.scan(rotate_point, rotation_matrix, control_points)
+        return rotated_control_points
+    
+    @staticmethod
+    @jax.jit
+    def _initial_vector_guess(t0_T, guess, guess_is_degen):
+        # Estimate initial vector
+        def alternate_guess(t0_T):
+            guess_alt = jnp.zeros(3)
+            max_axis = jnp.argmax(jnp.abs(t0_T))
+            other_axis = (max_axis + 1) % 3
+            guess_alt = guess_alt.at[max_axis].set(t0_T[other_axis])
+            guess_alt = guess_alt.at[other_axis].set(-t0_T[max_axis])
+            return guess_alt
+        guess = lax.cond(
+            guess_is_degen,
+            lambda x: alternate_guess(x),
+            lambda _: guess,
+            t0_T
+        )
+        return guess / (jnp.linalg.norm(guess) + 1e-12)
+
+    @staticmethod
+    def _convert_to_array(t):
+        is_single = False
+        if isinstance(t, (int, float)):
+            t = jnp.array([t])
+            is_single = True
+        elif isinstance(t, (list, tuple)):
+            t = jnp.array(t)
+        elif hasattr(t, 'shape') and t.shape == ():
+            t = jnp.array([t])
+            is_single = True
+        elif not isinstance(t, jnp.ndarray):
+            t = jnp.array(t)
+        if t.ndim > 1:
+            raise ValueError("t must be 1D array-like.")
+        return t, is_single
+
+    @staticmethod
+    @partial(jax.jit, static_argnames=['single_val'])
+    def _compute_spline_first_deriv(tval, control_points, single_val=False):
+        basis_vals_d1 = JaxB3._derivative_1(tval)
+        d1 = JaxSpline._eval_spline(basis_vals_d1, control_points)
+        if single_val:
+            d1 = d1[0]
+        return d1
+
+    @staticmethod
+    @jax.jit
+    def _tangent_vector_to_speed(d1):
+        """Helper function to compute differential length element."""
+        safe_d1 = jnp.nan_to_num(d1)
+        speed = jnp.linalg.norm(safe_d1, axis=-1)
+        return speed
+
+    @staticmethod
+    @partial(jax.jit, static_argnames=['M', 'half_support', 'closed', 'max_ninter'])
+    def _compute_curve_length(
+                                control_points, 
+                                M, half_support, pad, closed,
+                                start, stop, 
+                                epsabs, epsrel, max_ninter
+                                ):
+        integral = quadgk(
+            lambda t: JaxSpline._tangent_vector_to_speed(
+                JaxSpline._compute_spline_first_deriv(
+                    JaxSpline._get_tval(jnp.atleast_1d(t), M, half_support, pad, closed), control_points,
+                )
+            ),
+            [start, stop],
+            epsabs=epsabs,
+            epsrel=epsrel,
+            max_ninter=max_ninter,
+        )
+        return integral[0]
+
+    @staticmethod
+    @jax.jit
+    def _curvilinear_integrand(speed, c):
+        return (speed**2 - c)**2
+
+    @staticmethod
+    @partial(jax.jit, static_argnames=['M', 'half_support', 'closed', 'max_ninter'])
+    def _compute_curvilinear_reparametrization_energy(
+                                L, 
+                                control_points, 
+                                M, half_support, pad, closed,
+                                start, stop, 
+                                epsabs, epsrel, max_ninter
+                                ):
+        c = (L/M)**2
+        integral = quadgk(
+            lambda t: JaxSpline._curvilinear_integrand(
+                JaxSpline._tangent_vector_to_speed(
+                    JaxSpline._compute_spline_first_deriv(
+                        JaxSpline._get_tval(jnp.atleast_1d(t), M, half_support, pad, closed), control_points, single_val=True,
+                    )
+                ), c),
+            [start, stop],
+            epsabs=epsabs,
+            epsrel=epsrel,
+            max_ninter=max_ninter,
+        )
+        return integral[0] / (L**4)
+
+    @staticmethod
+    @partial(jax.jit, static_argnames=['M', 'half_support', 'closed'])
+    def _compute_spline_val_single_val(t, control_points, 
+                                       M, half_support, pad, closed
+                                       ):
+        t = jnp.atleast_1d(t)
+        tval = JaxSpline._get_tval(t, M, half_support, pad, closed)
+        basis_vals = JaxB3._func(tval)
+        return JaxSpline._eval_spline(basis_vals, control_points)
+
+    @staticmethod
+    @partial(jax.jit, static_argnames=['M', 'half_support', 'closed'])
+    def _spline_distance_to_point(t, point, control_points,
+                                M, half_support, pad, closed,
+                                ):
+        spline_point = JaxSpline._compute_spline_val_single_val(t, control_points, M, half_support, pad, closed)
+        return jnp.sum((spline_point - point)**2)
+
+    @staticmethod
+    @partial(jax.jit, static_argnames=['M', 'half_support', 'closed'])
+    @partial(jax.vmap, in_axes=(0, 0, None, None, None, None, None, None, None))
+    def _projected_newton_step(t, point, 
+                               control_points, min_t_bound, max_t_bound, M, half_support, pad, closed
+                               ):
+        grad_fn = jax.grad(JaxSpline._spline_distance_to_point, argnums=0) # only wrt t
+        hess_fn = jax.hessian(JaxSpline._spline_distance_to_point, argnums=0) # only wrt t
+        grad = grad_fn(t, point, control_points, M, half_support, pad, closed)
+        hess = hess_fn(t, point, control_points, M, half_support, pad, closed)
+        # Newton step
+        step = -grad / (hess + 1e-12)
+        new_tval = t + step
+        # Projected to bounds
+        new_tval = jnp.clip(new_tval, min_t_bound, max_t_bound)
+        return new_tval
+
+    @staticmethod
+    @partial(jax.jit, static_argnames=['M', 'half_support', 'closed', 'max_iters'])
+    def _find_closest_t_to_point(
+        t_inits, points,
+        control_points,
+        M, half_support, pad, closed,
+        min_t_bound, max_t_bound,
+        max_iters
+        ):
+        def scan_body_fn(curr_ts, _):
+            t = JaxSpline._projected_newton_step(curr_ts, points, control_points, min_t_bound, max_t_bound,
+                                        M, half_support, pad, closed)
+            return t, None
+        t_final, _ = lax.scan(scan_body_fn, t_inits, None, length=max_iters)
+        return t_final
+
+    @staticmethod
+    @partial(jax.jit, static_argnames=['closed'])
+    def _generate_connectivity(closed, n_angles, n_t, n_points):
+        raise NotImplementedError("Non-zero radius mesh not implemented yet.")
+        """
+        Generates mesh connectivity using broadcasting instead of loops.
+        Replaces the Numba functions.
+        """
+        # Create grid of indices (i, j)
+        # i goes from 0 to n_t-1 (or n_t if closed)
+        # j goes from 0 to n_angles-1
+        
+        limit_t = n_t if closed else n_t - 1
+        i_grid, j_grid = jnp.meshgrid(jnp.arange(limit_t), jnp.arange(n_angles), indexing='ij')
+        
+        # Flatten for processing
+        i = i_grid.flatten()
+        j = j_grid.flatten()
+        
+        # --- Surface Mesh (Triangles) ---
+        # Triangle 1: (i, j), ((i+1), j), ((i+1), (j+1))
+        p1 = i * n_angles + j
+        p2 = ((i + 1) * n_angles + j) % n_points
+        p3 = ((i + 1) * n_angles + (j + 1) % n_angles) % n_points
+        
+        # Triangle 2: (i, j), ((i+1), (j+1)), (i, (j+1))
+        p4 = i * n_angles + j
+        p5 = ((i + 1) * n_angles + (j + 1) % n_angles) % n_points
+        p6 = (i * n_angles + (j + 1) % n_angles) % n_points
+        
+        t1 = jnp.stack([p1, p2, p3], axis=1)
+        t2 = jnp.stack([p4, p5, p6], axis=1)
+        
+        # Interleave t1 and t2
+        surface_conn = jnp.empty((t1.shape[0] * 2, 3), dtype=jnp.int32)
+        surface_conn = surface_conn.at[0::2].set(t1)
+        surface_conn = surface_conn.at[1::2].set(t2)
+        
+        # --- Volume Mesh (Tetrahedra) ---
+        # Indices logic adapted from original code
+        # i * (n_angles + 1) + j ...
+        row_len = n_angles + 1
+        
+        # Recalculate p indices for volume (different stride)
+        v_p1 = i * row_len + j + 1 # offset j by 1 because j starts 0 here but 1 in original loop?
+        # Actually, let's stick to the logic: j goes 0..n_angles-1, mapped to 1..n_angles
+        jj = j + 1
+        
+        curr_row = i * row_len
+        next_row = (i + 1) * row_len
+        
+        # Tet 1
+        tp1 = curr_row + jj
+        tp2 = (next_row + jj) % n_points
+        tp3 = (next_row + 1 + (jj % n_angles)) % n_points
+        tp4 = (next_row) % n_points
+        
+        # Tet 2
+        tp5 = curr_row + jj
+        tp6 = (next_row + 1 + (jj % n_angles)) % n_points
+        tp7 = (curr_row + 1 + (jj % n_angles)) % n_points
+        tp8 = curr_row
+        
+        # Tet 3
+        tp9 = curr_row + jj
+        tp10 = (next_row + 1 + (jj % n_angles)) % n_points
+        tp11 = (next_row) % n_points
+        tp12 = curr_row
+        
+        # Stack
+        tet1 = jnp.stack([tp1, tp2, tp3, tp4], axis=1)
+        tet2 = jnp.stack([tp5, tp6, tp7, tp8], axis=1)
+        tet3 = jnp.stack([tp9, tp10, tp11, tp12], axis=1)
+        
+        vol_conn = jnp.empty((tet1.shape[0] * 3, 4), dtype=jnp.int32)
+        vol_conn = vol_conn.at[0::3].set(tet1)
+        vol_conn = vol_conn.at[1::3].set(tet2)
+        vol_conn = vol_conn.at[2::3].set(tet3)
+        
+        return surface_conn, vol_conn 
+
+    @staticmethod
+    @partial(jax.jit, static_argnames=['self_ndim', 'single_val'])
+    def _curvature(d1, d2, self_ndim, single_val):
+        # Handle 1D case (codomain dimension = 1)
+        # If ndim=1, we treat it as a graph y=f(x) where x=t.
+        # r(t) = [t, y(t)] -> r'(t) = [1, y'(t)], r''(t) = [0, y''(t)]
+        if self_ndim == 1:
+            # d1 is (N, 1) -> stack with ones -> (N, 2)
+            d1 = jnp.hstack([jnp.ones_like(d1), d1])
+            d2 = jnp.hstack([jnp.zeros_like(d2), d2])
+            
+        norm_d1 = jnp.linalg.norm(d1, axis=-1)
+        norm_d2 = jnp.linalg.norm(d2, axis=-1)
+
+        # Compute numerator
+        # We need to distinguish 2D (signed) vs ND (unsigned)
+        
+        # Helper for 2D signed curvature: x'y'' - y'x''
+        def signed_2d_numerator(d1, d2):
+            return d1[:, 1] * d2[:, 0] - d1[:, 0] * d2[:, 1]
+
+        # Helper for ND unsigned curvature
+        def unsigned_nd_numerator(d1, d2, norm_d1, norm_d2):
+            dot = jnp.sum(d1 * d2, axis=-1)
+            val = norm_d1**2 * norm_d2**2 - dot**2
+            return jnp.sqrt(jnp.maximum(val, 0.0))
+
+        # Check dimension (using shape of d1 which handles the 1D->2D promotion)
+        dim = d1.shape[-1]
+        
+        numerator = lax.cond(
+            dim == 2,
+            lambda _: signed_2d_numerator(d1, d2),
+            lambda _: unsigned_nd_numerator(d1, d2, norm_d1, norm_d2),
+            None
+        )
+        
+        # Avoid division by zero if velocity is zero
+        denom = norm_d1 ** 3
+        k = jnp.where(denom > 1e-12, numerator / denom, 0.0)
+        
+        if single_val:
+            return k[0]
+        return k
+
+    @staticmethod
+    @jax.jit
+    def _2d_normal_helper(d1):
+        # Rotate 90 degrees: [x, y] -> [-y, x]
+        normals = jnp.stack([-d1[:, 1], d1[:, 0]], axis=1)
+        normals = normals / jnp.linalg.norm(normals, axis=1, keepdims=True)
+        return normals
+
+    # #####################################
+    # Instance Methods
+    # #####################################
+
     def tree_flatten(self):
         children = (self.control_points,) # arrays / dynamic values
         aux_data = dict( # static values
@@ -817,7 +837,7 @@ class JaxSpline:
         data = _prepared_dict_for_constructor(data)
         return cls(**data)
     
-    def draw(self, x, y): #skip as dont need it
+    def draw(self, x, y):
         """
         Computes whether a point is inside or outside a closed
         spline on a regular grid of points.
@@ -964,17 +984,15 @@ class JaxSpline:
         limit = self.M if self.closed else self.M - 1
         t = jnp.linspace(0, limit, len(points), endpoint=not self.closed)
         
-        tval = _get_tval_jit(t, self.M, self._half_support, self._pad, self.closed) # this is array of shape (len(points), M) for closed and (len(points), M + 2*pad) for open
-        basis_vals = self.basis_function(tval, derivative=0) # this is also array of shape (len(points), M) or (len(points), M + 2*pad)
+        tval = self._get_tval(t, self.M, self._half_support, self._pad, self.closed) 
+        basis_vals = self.basis_function(tval, derivative=0) 
         
-        self.control_points = _fit_spline_jit(basis_vals, points)
+        self.control_points = self._fit_spline(basis_vals, points)
 
     @partial(jax.jit, static_argnames=['stop', 'start'])
     def arc_length(self, stop=None, start=0, epsabs:float=0.0, epsrel:float=1e-3):
         """
         Computes arc length quadax gauss-konrod "quadgk" integration.
-        Handle array-like start/stop via vmap outside if needed.
-        Replaces scipy.integrate.quad.
         """
         self._check_control_points()
         if stop is None:
@@ -986,7 +1004,7 @@ class JaxSpline:
         if start > stop:
             start, stop = stop, start
         
-        integral = _compute_curve_length_jit(
+        integral = self._compute_curve_length(
             self.control_points,
             self.M, self._half_support, self._pad, self.closed,
             start, stop,
@@ -1028,9 +1046,7 @@ class JaxSpline:
     def curvilinear_reparametrization_energy(self, epsabs=1e-6, epsrel=1e-6):
         """
         Computes the energy used to enforce equal knot spacing.
-        
-        Implements eq. 25 from [Jacob2004] using JIT-compiled Simpson's rule integration.
-        Replaces scipy.integrate.quad.
+        Implements eq. 25 from [Jacob2004]
 
         Parameters
         ----------
@@ -1043,7 +1059,6 @@ class JaxSpline:
         energy : float
         """
         # 1. Compute Arc Length (reusing our JIT-able arc_length)
-        # Note: We use the same n_samples for consistency
         L = self.arc_length(epsabs=epsabs, epsrel=epsrel)
         
         # Avoid division by zero if L is effectively 0
@@ -1051,19 +1066,7 @@ class JaxSpline:
         
         upper_limit = self.M if self.closed else self.M - 1
 
-        # c = (L / self.M) ** 2
-        # Use quadax quadgk
-        # integral = quadgk(
-        #     # lambda t: (jnp.sum(self(t, derivative=1)**2) - c) ** 2,
-        #     lambda t: (jnp.linalg.norm(jnp.nan_to_num(self(t, derivative=1)), axis=-1)**2 - c) ** 2,
-        #     [0, upper_limit],
-        #     epsabs=epsabs,
-        #     epsrel=epsrel,
-        #     max_ninter=100,
-        # )
-        # return integral[0] / (L**4)
-
-        return _compute_curvilinear_reparametrization_energy_jit(
+        return self._compute_curvilinear_reparametrization_energy(
             L, 
             self.control_points, 
             self.M, self._half_support, self._pad, self.closed,
@@ -1078,23 +1081,23 @@ class JaxSpline:
         Returns signed curvature for 2D, unsigned for others.
         """
         self._check_control_points()
-        t_arr, single_val = _convert_to_array(t)
+        t_arr, single_val = self._convert_to_array(t)
         
         # First and Second derivatives
         d1 = self(t_arr, derivative=1)
         d2 = self(t_arr, derivative=2)
         
-        return _curvature(d1, d2, self.ndim, single_val)
+        return self._curvature(d1, d2, self.ndim, single_val)
     
     
     def normal(self, t, frame="bishop", initial_vector=None):
         self._check_control_points()
-        t_arr, single = _convert_to_array(t)
+        t_arr, single = self._convert_to_array(t)
         
         if self.ndim == 2:
             d1 = self(t_arr, derivative=1)
             
-            normals = _2d_normal_helper(d1)
+            normals = self._2d_normal_helper(d1)
             if single: return normals[0]
             return normals
             
@@ -1114,7 +1117,7 @@ class JaxSpline:
         if self.ndim != 3:
             raise RuntimeError("Moving frame only implemented for 3D splines.")
         
-        t_arr, single_value = _convert_to_array(t)
+        t_arr, single_value = self._convert_to_array(t)
         
         # Sort t to ensure sequential scan works for Bishop
         sort_idx = jnp.argsort(t_arr)
@@ -1129,7 +1132,7 @@ class JaxSpline:
         
         if method == "frenet":
             # raise NotImplementedError("Frenet frame not implemented yet.")
-            frames, binormal_norms = _moving_frame_frenet(T, d2)
+            frames, binormal_norms = self._moving_frame_frenet(T, d2)
             if jnp.any(jnp.isclose(binormal_norms, 0.0)):
                 if jnp.isclose(binormal_norms[0], 0.0) or jnp.isclose(binormal_norms[-1], 0.0):
                     raise RuntimeError(
@@ -1139,15 +1142,12 @@ class JaxSpline:
                     "The Frenet frame is not defined for splines with inflection points or straight segments, try the Bishop frame instead."
                 )
         elif method == "bishop":
-            # Handle initial_vector None logic HERE, before passing to Bishop JIT
-            # This keeps the Bishop kernel clean and types consistent
-            
             if initial_vector is None:
                 guess = jnp.cross(jnp.cross(T[0], d2[0]), T[0])
                 guess_norm = jnp.linalg.norm(guess)
                 guess_is_degen = jnp.isclose(guess_norm, 0.0) or jnp.any(jnp.isnan(guess))
-                initial_vector = _initial_vector_guess_jit(T[0], guess, guess_is_degen)
-            frames = _moving_frame_bishop(T, d2, initial_vector)
+                initial_vector = self._initial_vector_guess(T[0], guess, guess_is_degen)
+            frames = self._moving_frame_bishop(T, initial_vector)
         else:
             raise ValueError(f"Unknown moving frame method: {method}")
         
@@ -1161,17 +1161,16 @@ class JaxSpline:
     def __call__(self, t, derivative=0):
         """JIT-optimized evaluation."""
         self._check_control_points()
-        t_arr, single_val = _convert_to_array(t)
+        t_arr, single_val = self._convert_to_array(t)
         
         # 1. Get t-vals (indices)
-        tval = _get_tval_jit(t_arr, self.M, self._half_support, self._pad, self.closed)
+        tval = self._get_tval(t_arr, self.M, self._half_support, self._pad, self.closed)
         
         # 2. Evaluate basis functions (Assuming basis_function is JAX-compatible/JIT-ed)
-        # Note: basis_function.__call__ should ideally be pure JAX
         basis_vals = self.basis_function(tval, derivative=derivative)
         
         # 3. Matrix Multiplication
-        value = _eval_spline_jit(basis_vals, self.control_points)
+        value = self._eval_spline(basis_vals, self.control_points)
         
         if single_val:
             return value[0]
@@ -1179,18 +1178,18 @@ class JaxSpline:
 
     def _control_points_centroid(self):
         self._check_control_points()
-        return _compute_control_point_centroid(self.control_points)
+        return self._compute_control_point_centroid(self.control_points)
     
     def translate(self, vector):
         """
         Translates the spline by the given vector.
         """
         self._check_control_points()
-        self.control_points = _compute_control_points_translated(self.control_points, vector)
+        self.control_points = self._compute_control_points_translated(self.control_points, vector)
 
     def scale(self, scaling_factor):
         self._check_control_points()
-        self.control_points = _compute_control_points_scaled(self.control_points, scaling_factor)
+        self.control_points = self._compute_control_points_scaled(self.control_points, scaling_factor)
 
     def rotate(self, rotation_matrix, centered=True):
         self._check_control_points()
@@ -1198,7 +1197,7 @@ class JaxSpline:
             centroid = self._control_points_centroid()
             self.translate(-centroid)
 
-        self.control_points = _compute_control_points_rotated(self.control_points, rotation_matrix)
+        self.control_points = self._compute_control_points_rotated(self.control_points, rotation_matrix)
 
         if centered:
             self.translate(centroid)
@@ -1206,8 +1205,7 @@ class JaxSpline:
     @partial(jax.jit, static_argnames=("return_t",))
     def distance(self, points, return_t=False):
         """
-        Computes distance using Gradient Descent/Newton methods in JAX 
-        instead of scipy.optimize.minimize (which is not JIT-able).
+        Computes distance using Gradient Descent/Newton methods in JAX.
         """
         self._check_control_points()
         if self.ndim == 1:
@@ -1224,41 +1222,12 @@ class JaxSpline:
         t_coarse = jnp.linspace(0.0, max_t, self.M * 10)
         pts_coarse = self(t_coarse) # (Grid, Dim)
         
-        best_idx = _compute_closest_indices_between_points(pts_coarse, points)
+        best_idx = self._compute_closest_indices_between_points(pts_coarse, points)
         t_init = t_coarse[best_idx]
         
         max_iter = 5
 
-        # # 2. Refinement using Gradient Descent (JIT-able)
-        # # We define a loss function for a single point/t pair
-        # def loss_fn(t, p):
-        #     val = self(t) # (Dim,)
-        #     return jnp.sum((val - p)**2)
-        
-        # grad_fn = jax.grad(loss_fn)
-        # hess_fn = jax.hessian(loss_fn)
-        
-        # def projected_newton_step(t, p, min_t_bound, max_t_bound):
-        #     # Simple Newton step: t_new = t - g / h
-        #     # Clipped to bounds
-        #     g = grad_fn(t, p)
-        #     h = hess_fn(t, p)
-        #     h_safe = jnp.where(h > 1e-4, h, 1.0) # h_safe = 1 degenerates to GD
-
-        #     step = g / h_safe
-
-        #     return jnp.clip(t - step, min_t_bound, max_t_bound)
-
-        # # Iterate a few times
-        # # vmap over the batch of points
-        # batched_projected_newton_step = jax.vmap(projected_newton_step, in_axes=(0, 0, None, None))
-        
-        # def scan_body(curr_t, _):
-        #     next_t = batched_projected_newton_step(curr_t, points, 0.0, max_t)
-        #     return next_t, None
-        
-        # final_t, _ = jax.lax.scan(scan_body, t_init, None, length=max_iter)
-        final_t = _find_closest_t_to_point_jit(
+        final_t = self._find_closest_t_to_point(
             t_init, points,
             self.control_points,
             self.M, self._half_support, self._pad, self.closed,
@@ -1307,7 +1276,8 @@ class JaxSpline:
             return centers, connectivity
         else:
             raise NotImplementedError("Non-zero radius mesh not implemented yet.")
-            # Calculate Frames and Centers
+            
+            # # Calculate Frames and Centers
             frames = self.moving_frame(t, method=frame, initial_vector=initial_vector)
             normals = frames[:, 1, :]
             binormals = frames[:, 2, :] # Or derived from frame
@@ -1493,7 +1463,7 @@ def splines_from_json(path):
         if spline_data["basis_function"].multigenerator:
             raise NotImplementedError("Loading Hermite splines from json is not implemented yet.")
             # This is a basis function for a Hermite spline
-            splines.append(HermiteSpline(**spline_data))
+            # splines.append(HermiteSpline(**spline_data))
         else:
             splines.append(JaxSpline(**spline_data))
 
