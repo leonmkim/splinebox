@@ -62,8 +62,10 @@ class JaxBasisFunction:
             return self._derivative_1(t)
         elif derivative == 2:
             return self._derivative_2(t)
+        elif derivative == 3:
+            return self._derivative_3(t)
         else:
-            raise ValueError(f"derivative has to be 0, 1, or 2 not {derivative}")
+            raise ValueError(f"derivative has to be 0, 1, 2, or 3 not {derivative}")
 
     def _func(self, t):
         raise NotImplementedError(JaxBasisFunction._unimplemented_message)
@@ -72,6 +74,9 @@ class JaxBasisFunction:
         raise NotImplementedError(JaxBasisFunction._unimplemented_message)
 
     def _derivative_2(self, t):
+        raise NotImplementedError(JaxBasisFunction._unimplemented_message)
+
+    def _derivative_3(self, t):
         raise NotImplementedError(JaxBasisFunction._unimplemented_message)
 
     def filter_symmetric(self, s):
@@ -147,6 +152,29 @@ class JaxB3(JaxBasisFunction):
     @vectorize
     def _derivative_2(t: float):
         return jax.grad(JaxB3._derivative_1)(t)
+        # # t = jnp.asarray(t)
+
+        # # 0 <= t < 1
+        # v1 = -2 + 3 * t
+        # # -1 < t < 0
+        # v2 = -2 - 3 * t
+        # # 1 <= t <= 2
+        # v3 = 2 - t
+        # # -2 <= t <= -1
+        # v4 = 2 + t
+
+        # cond1 = (t >= 0) & (t < 1)
+        # cond2 = (t > -1) & (t < 0)
+        # cond3 = (t >= 1) & (t <= 2)
+        # cond4 = (t >= -2) & (t <= -1)
+
+        # return jnp.select([cond1, cond2, cond3, cond4], [v1, v2, v3, v4], default=0.0)
+
+    @staticmethod
+    @jit
+    @vectorize
+    def _derivative_3(t: float):
+        return jax.grad(JaxB3._derivative_2)(t)
         # # t = jnp.asarray(t)
 
         # # 0 <= t < 1
