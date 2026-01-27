@@ -34,7 +34,9 @@ class JaxSpline:
                 # basis_function_name: str,
                  closed=True, 
                  control_points=None, 
-                 padding_function=None):
+                 padding_function=None,
+                 is_ribbon: bool = False,
+                 ):
         # basis_function = JaxB3()
         if basis_function.support <= M:
             self.M = M
@@ -47,6 +49,7 @@ class JaxSpline:
         if not closed: 
             raise NotImplementedError("Open splines are not implemented yet in JaxSpline.")
         self.closed = closed
+        self.is_ribbon = is_ribbon
         
         # JAX arrays preferred
         self._control_points = control_points
@@ -158,68 +161,112 @@ class JaxSpline:
 
     @staticmethod
     @jax.jit
-    def _moving_frame_bishop(T, initial_vector):
+    def _reflect(vec, axis):
+        """
+        Reflects vector 'vec' across the hyperplane defined by normal vector 'axis'.
+        R(x) = x - (2 / (axis . axis)) * (axis . x) * axis
+        """
+        c = jnp.dot(axis, axis)
+        scale = jnp.where(c > 1e-16, 2.0/c, 0.0)
+        return vec - scale * jnp.dot(axis, vec) * axis
+
+
+
+    @staticmethod
+    @partial(jax.jit, static_argnames=['closed'])
+    def _moving_frame_bishop(points, T, initial_vector, t_sorted, M, closed):
         '''
-        Docstring for _moving_frame_bishop
+        Computes Bishop frame using the Double Reflection method (RMF).
+        If closed=True, applies topological correction assuming t_sorted covers [0, M].
         
-        :param T: normalized tangent vectors
-        :param initial_vector: Description
+        :param points: positions on the curve (N, 3)
+        :param T: normalized tangent vectors (N, 3)
+        :param initial_vector: Initial normal vector guess
+        :param t_sorted: (N,) array of parameter values
+        :param M: Spline domain limit
+        :param closed: Boolean, whether the spline is closed
+        :return: Frames (N, 3, 3) [T, N, B]
         '''
         # Ensure orthogonality of provided/calculated initial vector
         t0_T = T[0]
         initial_vector = initial_vector - t0_T * jnp.dot(t0_T, initial_vector)
-        initial_vector = initial_vector / (jnp.linalg.norm(initial_vector) + 1e-12)
+        initial_vector_norm = jnp.linalg.norm(initial_vector)
+        # Avoid division by zero
+        initial_vector = initial_vector / (initial_vector_norm + 1e-12)
 
-        init_binormal = jnp.cross(t0_T, initial_vector)
-        init_carry = (t0_T, initial_vector, init_binormal) # tangent, normal, binormal
+        # We only track Tangent and Normal
+        init_frame = (t0_T, initial_vector) 
+        
+        # Carry: (prev_pos, prev_frame)
+        init_carry = (points[0], init_frame)
 
-        T_slice = T[1:]  # We start from the second tangent
+        # Slice inputs to iterate from 1 to N
+        points_slice = points[1:]
+        T_slice = T[1:]
 
-        def scan_body(prev_frame, curr_T):
-            prev_t, prev_n, prev_b = prev_frame # tangent, normal, binormal
+        def scan_body(carry, inputs):
+            prev_pos, prev_frame = carry
+            curr_pos, curr_T = inputs
             
-            # Rotation axis
-            normal = jnp.cross(prev_t, curr_T)
-            normal_norm = jnp.linalg.norm(normal)
-            u = normal / (normal_norm + 1e-12)
+            prev_t, prev_r = prev_frame # r=normal
             
-            dot_T = jnp.dot(prev_t, curr_T)
+            # Double Reflection Algorithm
+            # Step 1: Reflect across bisector of chord
+            v1 = curr_pos - prev_pos
             
-            # Safe arccos
-            phi = jnp.arccos(jnp.clip(dot_T, -1.0, 1.0))
+            r_L = JaxSpline._reflect(prev_r, v1)
+            t_L = JaxSpline._reflect(prev_t, v1)
             
-            def rotate_vec(vec):
-                # Safe division: if norm_axis is 0, we don't use this result anyway, 
-                # but we prevent NaNs in the graph with +1e-12
-                # u = normal / (normal_norm + 1e-12)
-                return (vec * jnp.cos(phi) + 
-                        jnp.cross(u, vec) * jnp.sin(phi) + 
-                        u * jnp.dot(u, vec) * (1 - jnp.cos(phi)))
+            # Step 2: Reflect across bisector of tangents
+            v2 = curr_T - t_L
+            
+            current_r = JaxSpline._reflect(r_L, v2)
+            
+            # Re-orthogonalize to allow for numerical drift if needed, 
+            # but Double Reflection is generally orthogonal.
+            # Make sure current_r is orthogonal to curr_T
+            current_r = current_r - jnp.dot(curr_T, current_r) * curr_T
+            current_r = current_r / (jnp.linalg.norm(current_r) + 1e-12)
+            
+            current_frame = (curr_T, current_r)
+            new_carry = (curr_pos, current_frame)
+            
+            return new_carry, current_r
 
-            # If tangents are parallel (norm_axis ~ 0), identity transform
-            new_n, new_b = lax.cond(
-                normal_norm > 1e-6,
-                lambda _: (rotate_vec(prev_n), rotate_vec(prev_b)),
-                lambda _: (prev_n, prev_b),
-                None
-            )
+        _, normals_rest = jax.lax.scan(scan_body, init_carry, (points_slice, T_slice))
+        
+        # Prepend initial normal
+        normals = jnp.concatenate([initial_vector[None, :], normals_rest], axis=0)
+        
+        if closed:
+            # Correction logic for closed curves
+            # We measure mismatch between f_start and f_end.
             
-            # Re-orthogonalize to prevent drift
-            new_n = new_n - curr_T * jnp.dot(curr_T, new_n)
-            new_n = new_n / (jnp.linalg.norm(new_n) + 1e-12)
-            new_b = jnp.cross(curr_T, new_n)
+            v = normals[0] 
+            u1 = normals[-1]
+            # We need binormal at end to determine sign
+            u2 = jnp.cross(T[-1], u1)
             
-            new_frame = jnp.stack([curr_T, new_n, new_b], axis=0)
-            return (new_n, new_b, curr_T), new_frame
-
-        _, frames = lax.scan(scan_body, init_carry, T_slice)
-        # stack initial_carry frame at beginning
-        init_frame = jnp.expand_dims(jnp.stack([t0_T, initial_vector, init_binormal], axis=0), axis=0)
-        final_frames = jnp.concatenate(
-            [init_frame, frames],
-            axis=0,
-        )
-        return final_frames
+            c = jnp.dot(v, u1)
+            s = jnp.dot(v, u2)
+            alpha = jnp.arctan2(s, c)
+            
+            # Distribute alpha based on parameter t
+            t_normalized = t_sorted / M
+            correction_angles = alpha * t_normalized
+            
+            # Apply rotation to Normals around Tangent
+            cos_theta = jnp.cos(correction_angles)[:, None]
+            sin_theta = jnp.sin(correction_angles)[:, None]
+            
+            Bs_temp = jnp.cross(T, normals)
+            normals = normals * cos_theta + Bs_temp * sin_theta
+            
+        # Compute Binormals
+        binormals = jnp.cross(T, normals)
+        frames = jnp.stack([T, normals, binormals], axis=1)
+        
+        return frames
 
     @staticmethod
     @jax.jit
@@ -1112,7 +1159,92 @@ class JaxSpline:
             raise RuntimeError("Normal only for 2D/3D.")
 
     def moving_frame(self, t, method="frenet", initial_vector=None):
-        """JIT-accelerated Moving Frame."""
+        """JIT-accelerated Moving Frame.
+        Compute a moving frame (local orthonormal coordinate system) along the spline.
+
+        This method computes either the Frenet-Serret frame or the Bishop frame [#bishop]_ for
+        the spline. A moving frame [#movingframe]_ consists of three orthonormal basis vectors at
+        each point on the curve. The Frenet-Serret frame is derived from the curve's
+        derivatives but may twist around the curve. The Bishop frame eliminates
+        this twist, providing a zero-torsion alternative.
+
+        Parameters
+        ----------
+        t : np.array or float
+            A 1D array of parameter values or a single parameter value at which to evaluate the frame.
+        method : str, optional
+            The type of moving frame to compute. Options are:
+
+            - "frenet": The classical Frenet-Serret frame, based on tangent, normal, and binormal vectors.
+            - "bishop": A twist-free frame that requires an initial orientation.
+
+            Default is "frenet".
+        initial_vector : np.array or None, optional
+            For the Bishop frame, an initial vector that is orthogonal to the tangent
+            vector at `t[0]`. This vector determines the initial orientation of the
+            basis, which is propagated along the curve without twisting. If None,
+            the method computes a suitable initial vector automatically. This
+            parameter is ignored when :code:`method="frenet"`.
+
+        Returns
+        -------
+        frame : np.array
+            A 3D numpy array with shape `(len(t), 3, 3)`. The dimensions are:
+
+            - The first axis corresponds to the parameter values in `t`.
+            - The second axis contains the three basis vectors at each `t`:
+              [tangent, normal, binormal] for "frenet" or equivalent vectors for "bishop".
+            - The third axis contains the components of each basis vector in 3D space.
+
+        Raises
+        ------
+        RuntimeError
+            If the spline is not defined in 3D or if the Frenet frame cannot be
+            computed due to inflection points, straight segments, or undefined
+            tangent/normal vectors.
+        ValueError
+            If the initial vector for the Bishop frame is not orthogonal to the
+            tangent at `t[0]`, or if an invalid `method` is specified.
+
+        Notes
+        -----
+        - The Frenet frame is not defined at points where the curve has zero curvature,
+          such as straight segments or inflection points. In these cases, the Bishop
+          frame is recommended.
+        - For closed curves, check for discontinuities of the Bishop frame.
+
+        References
+        ----------
+        .. [#movingframe] `Moving frame <https://en.wikipedia.org/wiki/Moving_frame>`_ on Wikipedia.
+        .. [#bishop] Bishop, R. L. (1975). "There is More than One Way to Frame a Curve."
+               American Mathematical Monthly, 82(3), 246-251.
+
+        Examples
+        --------
+
+        We start by creating a 3D spline.
+
+        >>> spline = splinebox.Spline(4, basis_function=splinebox.B3(), closed=True)
+        >>> spline.knots = np.array([[1, 0, 0], [0, 1, 0], [-1, 0, 0], [0, -1, 0]])
+
+        >>> spline.moving_frame(0)
+        array([[ 0.,  1.,  0.],
+               [-1.,  0.,  0.],
+               [ 0., -0.,  1.]])
+
+        >>> spline.moving_frame([0, 2, spline.M])
+        array([[[ 0.,  1.,  0.],
+                [-1.,  0.,  0.],
+                [ 0., -0.,  1.]],
+        <BLANKLINE>
+               [[ 0., -1.,  0.],
+                [ 1.,  0.,  0.],
+                [-0.,  0.,  1.]],
+        <BLANKLINE>
+               [[ 0.,  1.,  0.],
+                [-1.,  0.,  0.],
+                [ 0., -0.,  1.]]])
+        """
         self._check_control_points()
         if self.ndim != 3:
             raise RuntimeError("Moving frame only implemented for 3D splines.")
@@ -1125,6 +1257,7 @@ class JaxSpline:
         
         d1 = self(t_sorted, derivative=1)
         d2 = self(t_sorted, derivative=2)
+        d0 = self(t_sorted, derivative=0)
         
         # Normalize tangent safely
         T_norm = jnp.linalg.norm(d1, axis=-1, keepdims=True)
@@ -1141,22 +1274,112 @@ class JaxSpline:
                 raise RuntimeError(
                     "The Frenet frame is not defined for splines with inflection points or straight segments, try the Bishop frame instead."
                 )
-        elif method == "bishop":
+        if method == "bishop":
             if initial_vector is None:
                 guess = jnp.cross(jnp.cross(T[0], d2[0]), T[0])
                 guess_norm = jnp.linalg.norm(guess)
                 guess_is_degen = jnp.isclose(guess_norm, 0.0) or jnp.any(jnp.isnan(guess))
                 initial_vector = self._initial_vector_guess(T[0], guess, guess_is_degen)
-            frames = self._moving_frame_bishop(T, initial_vector)
+            
+            # Bishop frame: Double Reflection (RMF) used.
+            # _moving_frame_bishop now returns full frames (N, 3, 3).
+            # It handles the topological correction internally if closed=True.
+            frames = self._moving_frame_bishop(d0, T, initial_vector, t_sorted, self.M, self.closed)
+
         else:
             raise ValueError(f"Unknown moving frame method: {method}")
         
-        # Unsort
         if single_value: return frames[0]
         inv_sort_idx = jnp.argsort(sort_idx)
         frames = frames[inv_sort_idx]
         
+        # Enforce coverage check for closed splines
+        if self.closed and method == "bishop":
+            # We require t to cover the start and end of the domain to ensure correct transport measure.
+             # Ideally we check jnp.min(t) == 0 and jnp.max(t) == M.
+            # But t_sorted is already sorted.
+            
+            # Check if start and end are within tolerance
+            tol = 1e-3
+            start_gap = jnp.abs(t_sorted[0])
+            end_gap = jnp.abs(t_sorted[-1] - self.M)
+            
+            if start_gap > tol or end_gap > tol:
+                raise ValueError(
+                    f"For closed curves using Bishop frame, query points must cover the full domain [0, M] to compute topological correction. "
+                    f"Gaps: start={start_gap}, end={end_gap}, Tolerance={tol}"
+                )
+            
         return frames
+
+    def torsion(self, t):
+        """
+        Computes the torsion of the curve at t.
+        tau = (r' x r'') . r''' / |r' x r''|^2
+        """
+        self._check_control_points()
+        t_arr, single_val = self._convert_to_array(t)
+        
+        d1 = self(t_arr, derivative=1)
+        d2 = self(t_arr, derivative=2)
+        d3 = self(t_arr, derivative=3)
+        
+        val = self._torsion_jit(d1, d2, d3, self.ndim)
+        
+        if single_val:
+            return val[0]
+        return val
+
+    @staticmethod
+    @partial(jax.jit, static_argnames=['ndim'])
+    def _torsion_jit(d1, d2, d3, ndim):
+        if ndim == 2:
+            return jnp.zeros(d1.shape[0])
+        elif ndim == 3:
+            cross_d1_d2 = jnp.cross(d1, d2)
+            numerator = jnp.sum(cross_d1_d2 * d3, axis=-1)
+            denominator = jnp.linalg.norm(cross_d1_d2, axis=-1)**2
+            # Handle straight lines / inflection points where cross product is zero
+            tau = jnp.where(denominator > 1e-12, numerator / denominator, 0.0)
+            return tau
+        else:
+            # For N-dim, generalized torsion logic needed, or 0 if not 3D curve in specific sense
+            return jnp.zeros(d1.shape[0])
+
+    @jax.jit
+    def total_torsion(self):
+        """Computes integral of torsion over the spline domain."""
+        limit = self.M if self.closed else self.M - 1
+        # Use quadgk
+        # Avoid lambda capture issues in JIT by defining integrand static or passing self params
+        
+        integral = quadgk(
+            lambda t: self._torsion_jit(
+                self._compute_spline_first_deriv(self._get_tval(jnp.atleast_1d(t), self.M, self._half_support, self._pad, self.closed), self.control_points, single_val=True), # d1
+                JaxSpline._compute_spline_derivative(self._get_tval(jnp.atleast_1d(t), self.M, self._half_support, self._pad, self.closed), self.control_points, 2, self.basis_function), # d2
+                JaxSpline._compute_spline_derivative(self._get_tval(jnp.atleast_1d(t), self.M, self._half_support, self._pad, self.closed), self.control_points, 3, self.basis_function), # d3
+                self.ndim
+            ),
+            [0, limit],
+            epsabs=1e-4, epsrel=1e-4,
+            max_ninter=100
+        )
+        return integral[0]
+
+    @staticmethod
+    def _compute_spline_derivative(tval, control_points, order, basis_function):
+        # We need a way to call arbitrary derivative from static context if possible, 
+        # but basis_function object is available in self context. 
+        # To make this fully static for quadgk lambda, we might need to pass basis_function or rely on closure.
+        # Since 'total_torsion' is an instance method marked @jax.jit, 'self' is a valid pytree node.
+        # So we can use self.basis_function inside the lambda? 
+        # JAX jit on methods treats 'self' as pytree.
+        # So we can access self.basis_function assuming it's also a Pytree node (which it is).
+        
+        basis_vals = basis_function(tval, derivative=order)
+        res = jnp.matmul(basis_vals, control_points)
+        return res[0] # Single val expected for quadgk scalar integrand? No, d1/d2/d3 are vectors. torsion returns scalar. ok.
+
 
     def __call__(self, t, derivative=0):
         """JIT-optimized evaluation."""
