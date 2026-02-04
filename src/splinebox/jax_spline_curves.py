@@ -54,6 +54,11 @@ class JaxSpline:
         self.is_ribbon = is_ribbon
         if self.is_ribbon:
             assert ribbon_width is not None, "if spline is ribbon, the ribbon_width must be specified!"
+
+            # convert ribbon width to jax array
+            if not isinstance(ribbon_width, jnp.ndarray):
+                ribbon_width = jnp.array(ribbon_width, dtype=jnp.float32)
+
         self.ribbon_width = ribbon_width
         self._frame_cache = None # Tuple (t_grid, frames_grid) if cached
         
@@ -65,7 +70,7 @@ class JaxSpline:
         if control_points is not None:
             # if not isinstance(control_points, jnp.ndarray):
             if isinstance(control_points, (list, tuple, np.ndarray)):
-                control_points = jnp.array(control_points)
+                control_points = jnp.array(control_points, dtype=jnp.float32)
             
             self.control_points = control_points # Use setter
 
@@ -161,7 +166,7 @@ class JaxSpline:
     def control_points(self, values):
         if values is not None:
             if isinstance(values, (list, tuple, np.ndarray)):
-                values = jnp.array(values)
+                values = jnp.array(values, dtype=jnp.float32)
             
             # n = len(values)
             n = values.shape[-2]
@@ -228,7 +233,7 @@ class JaxSpline:
 
     @knots.setter
     def knots(self, values):
-        knots = jnp.array(values)
+        knots = jnp.array(values, dtype=jnp.float32)
         n = len(knots)
         
         if self.closed:
@@ -564,7 +569,7 @@ class JaxSpline:
         points: array-like, shape (N, ndim)
         """
         if not isinstance(points, jnp.ndarray):
-            points = jnp.array(points)
+            points = jnp.array(points, dtype=jnp.float32)
         
         if len(points) < 2*(self.M + 2 * self.pad):
             raise RuntimeError(
@@ -728,8 +733,10 @@ class JaxSpline:
             d1 = jnp.hstack([jnp.ones_like(d1), d1])
             d2 = jnp.hstack([jnp.zeros_like(d2), d2])
             
-        norm_d1 = jnp.linalg.norm(d1, axis=-1)
-        norm_d2 = jnp.linalg.norm(d2, axis=-1)
+        # norm_d1 = jnp.linalg.norm(d1, axis=-1)
+        norm_d1 = JaxSpline._safe_2norm(d1)
+        # norm_d2 = jnp.linalg.norm(d2, axis=-1)
+        norm_d2 = JaxSpline._safe_2norm(d2)
 
         # Compute numerator
         # We need to distinguish 2D (signed) vs ND (unsigned)
@@ -788,7 +795,9 @@ class JaxSpline:
     def _2d_normal_helper(d1):
         # Rotate 90 degrees: [x, y] -> [-y, x]
         normals = jnp.stack([-d1[:, 1], d1[:, 0]], axis=1)
-        normals = normals / jnp.linalg.norm(normals, axis=1, keepdims=True)
+        normals_norm = JaxSpline._safe_2norm(normals, keep_dims=True)
+        # normals = normals / jnp.linalg.norm(normals, axis=1, keepdims=True)
+        normals = normals / normals_norm
         return normals
     
     def moving_frame(self, t, method="frenet", initial_vector=None):
@@ -885,7 +894,7 @@ class JaxSpline:
         t_arr, single_value = self._convert_to_array(t)
 
         # Optimization: Check cache first for Bishop frames on ribbons
-        if method == "bishop" and self.is_ribbon and (self._frame_cache is not None):
+        if method == "bishop" and self.is_ribbon and self._frame_cache is not None:
             # Note: _interpolate_frames takes (t, cache, closed, M)
             # cache is (t_grid, frames_grid)
             frames = self._interpolate_frames(t_arr, self._frame_cache, closed=self.closed, M=self.M)
@@ -902,7 +911,8 @@ class JaxSpline:
         d0 = self(t_sorted, derivative=0)
         
         # Normalize tangent safely
-        T_norm = jnp.linalg.norm(d1, axis=-1, keepdims=True)
+        # T_norm = jnp.linalg.norm(d1, axis=-1, keepdims=True)
+        T_norm = JaxSpline._safe_2norm(d1, keep_dims=True)
         T = d1 / (T_norm + 1e-12)
         
         if method == "frenet":
@@ -921,7 +931,8 @@ class JaxSpline:
                 # We can use Frenet binormal as a guess if valid, or arbitrary
                 # Using cross(T, d2) gives binormal direction ~ Frenet normal
                 guess = jnp.cross(jnp.cross(T[0], d2[0]), T[0])
-                guess_norm = jnp.linalg.norm(guess)
+                # guess_norm = jnp.linalg.norm(guess)
+                guess_norm = JaxSpline._safe_2norm(guess)
                 # Check for degenerate guess (straight line or inflection at start)
                 guess_is_degen = (guess_norm < 1e-6) | jnp.any(jnp.isnan(guess))
                 
@@ -1009,14 +1020,29 @@ class JaxSpline:
         T_approx = F[:, 0, :]
         N_approx = F[:, 1, :]
 
-        T_new = T_approx / (jnp.linalg.norm(T_approx, axis=-1, keepdims=True) + 1e-12)
+        T_approx_norm = JaxSpline._safe_2norm(T_approx, keep_dims=True)
+        # T_new = T_approx / (jnp.linalg.norm(T_approx, axis=-1, keepdims=True) + 1e-12)
+        T_new = T_approx / (T_approx_norm + 1e-12)
         dot_nt = jnp.sum(N_approx * T_new, axis=-1, keepdims=True)
         N_ortho = N_approx - dot_nt * T_new
-        N_new = N_ortho / (jnp.linalg.norm(N_ortho, axis=-1, keepdims=True) + 1e-12)
+        N_ortho_norm = JaxSpline._safe_2norm(N_ortho, keep_dims=True)
+        # N_new = N_ortho / (jnp.linalg.norm(N_ortho, axis=-1, keepdims=True) + 1e-12)
+        N_new = N_ortho / (N_ortho_norm + 1e-12)
 
         B_new = jnp.cross(T_new, N_new)
         return jnp.stack([T_new, N_new, B_new], axis=1)
     
+    @property
+    def frame_cache(self):
+        """Get cached Bishop frames for ribbons, computing if necessary."""
+        if not self.is_ribbon:
+            raise RuntimeError("Frame cache only for ribbons.")
+        
+        if self._frame_cache is None:
+            # Compute and cache
+            self._frame_cache = self._compute_dense_bishop_frames()
+        
+        return self._frame_cache
 
     @staticmethod
     @partial(jax.jit, static_argnames=['closed'])
@@ -1036,7 +1062,8 @@ class JaxSpline:
         # Ensure orthogonality of provided/calculated initial vector
         t0_T = T[0]
         initial_vector = initial_vector - t0_T * jnp.dot(t0_T, initial_vector)
-        initial_vector_norm = jnp.linalg.norm(initial_vector)
+        # initial_vector_norm = jnp.linalg.norm(initial_vector)
+        initial_vector_norm = JaxSpline._safe_2norm(initial_vector)
         # Avoid division by zero
         initial_vector = initial_vector / (initial_vector_norm + 1e-12)
 
@@ -1072,7 +1099,7 @@ class JaxSpline:
             # but Double Reflection is generally orthogonal.
             # Make sure current_r is orthogonal to curr_T
             current_r = current_r - jnp.dot(curr_T, current_r) * curr_T
-            current_r = current_r / (jnp.linalg.norm(current_r) + 1e-12)
+            current_r = current_r / (JaxSpline._safe_2norm(current_r) + 1e-12)
             
             current_frame = (curr_T, current_r)
             new_carry = (curr_pos, current_frame)
@@ -1122,7 +1149,7 @@ class JaxSpline:
         R(x) = x - (2 / (axis . axis)) * (axis . x) * axis
         """
         c = jnp.dot(axis, axis)
-        scale = jnp.where(c > 1e-16, 2.0/c, 0.0)
+        scale = jnp.where(c > 1e-16, 2.0/(c+1e-16), 0.0)
         return vec - scale * jnp.dot(axis, vec) * axis
 
     @staticmethod
@@ -1137,7 +1164,8 @@ class JaxSpline:
         '''
         # Binormal = T x N_approx
         binormals = jnp.cross(T, normal_approx)
-        binormal_norms = jnp.linalg.norm(binormals, axis=-1, keepdims=True)
+        # binormal_norms = jnp.linalg.norm(binormals, axis=-1, keepdims=True)
+        binormal_norms = JaxSpline._safe_2norm(binormals, keep_dims=True)
         
         binormal_normalized = binormals / binormal_norms
         
@@ -1186,15 +1214,15 @@ class JaxSpline:
     def _convert_to_array(t):
         is_single = False
         if isinstance(t, (int, float)):
-            t = jnp.array([t])
+            t = jnp.array([t], dtype=jnp.float32)
             is_single = True
         elif isinstance(t, (list, tuple)):
-            t = jnp.array(t)
+            t = jnp.array(t, dtype=jnp.float32)
         elif hasattr(t, 'shape') and t.shape == ():
-            t = jnp.array([t])
+            t = jnp.array([t], dtype=jnp.float32)
             is_single = True
         elif not isinstance(t, jnp.ndarray):
-            t = jnp.array(t)
+            t = jnp.array(t, dtype=jnp.float32)
         if t.ndim > 1:
             raise ValueError("t must be 1D array-like.")
         return t, is_single
@@ -1393,7 +1421,7 @@ class JaxSpline:
     @staticmethod
     @jax.jit
     def _safe_normalize(v, eps=1e-12):
-        n = jnp.linalg.norm(v, axis=-1, keepdims=True)
+        n = JaxSpline._safe_2norm(v, keep_dims=True)
         return v / (n + eps)
     
     @staticmethod
@@ -1509,14 +1537,16 @@ class JaxSpline:
             lambda _: guess,
             t0_T
         )
-        return guess / (jnp.linalg.norm(guess) + 1e-12)
+        # return guess / (jnp.linalg.norm(guess) + 1e-12)
+        return guess / (JaxSpline._safe_2norm(guess) + 1e-12)
 
     @staticmethod
     @jax.jit
     def _tangent_vector_to_speed(d1):
         """Helper function to compute differential length element."""
         safe_d1 = jnp.nan_to_num(d1)
-        speed = jnp.linalg.norm(safe_d1, axis=-1)
+        # speed = jnp.linalg.norm(safe_d1, axis=-1)
+        speed = JaxSpline._safe_2norm(safe_d1)
         return speed
 
     @staticmethod
@@ -1558,15 +1588,18 @@ class JaxSpline:
         if self.ndim == 1:
             raise RuntimeError("cant compute distance for 1D splines.")
         
+        points = jnp.asarray(points, dtype=jnp.float32)
+
         single_point = False
         if points.ndim == 1:
             points = jnp.expand_dims(points, axis=0)
             single_point = True
         
-        max_t = float(self.M if self.closed else self.M - 1)
+        max_t = jnp.asarray(float(self.M if self.closed else self.M - 1), dtype=jnp.float32)
+        min_t = jnp.asarray(0.0, dtype=jnp.float32)
         
         # 1. Coarse search to find initialization
-        t_coarse = jnp.linspace(0.0, max_t, self.M * 10)
+        t_coarse = jnp.linspace(0.0, max_t, self.M * 10, dtype=jnp.float32)
         
         if self.is_ribbon:
              # Coarse search on centerline first
@@ -1578,15 +1611,17 @@ class JaxSpline:
         t_init = t_coarse[best_idx]
 
         if not self.is_ribbon:
-             max_iter = 5
-             final_t = self._find_closest_t_to_point(
+            max_iter = 5
+            final_t = self._find_closest_t_to_point(
                 t_init, points,
                 self.control_points,
                 self.M, self._half_support, self._pad, self.closed,
-                0.0, max_t,
+                min_t, max_t,
                 max_iter,
             )
-             final_pos = self(final_t)
+            t_sg = jax.lax.stop_gradient(final_t)
+            #  final_pos = self(final_t)
+            final_pos = self(t_sg)
 
         else:
             max_iter = 20
@@ -1597,22 +1632,29 @@ class JaxSpline:
             # Optimize (t, u)
             final_t, final_u = self._find_closest_ribbon_point(
                 t_init, points,
-                0.0, max_t, max_iter
+                min_t, max_t, max_iter
             )
-            
-            final_pos = self.ribbon_surface(final_t, final_u)
+            t_sg = jax.lax.stop_gradient(final_t)
+            u_sg = jax.lax.stop_gradient(final_u)
+            final_pos = self.ribbon_surface(t_sg, u_sg)
+            # final_pos = self.ribbon_surface(final_t, final_u)
         
-        min_dists = jnp.linalg.norm(final_pos - points, axis=1)
+        # min_dists = jnp.linalg.norm(final_pos - points, axis=1)
+        # safe sqrt
+        min_dists = JaxSpline._safe_2norm(final_pos - points)
 
         if single_point:
             min_dists = min_dists[0]
             if not self.is_ribbon:
-                 final_t = final_t[0]
+                #  final_t = final_t[0]
+                 final_t = t_sg[0]
             else:
-                 final_t = (final_t[0], final_u[0])
+                #  final_t = (final_t[0], final_u[0])
+                final_t = (t_sg[0], u_sg[0])
         elif self.is_ribbon:
-             # Batch mode ribbon: return tuple of arrays
-             final_t = (final_t, final_u)
+            # Batch mode ribbon: return tuple of arrays
+            #  final_t = (final_t, final_u)
+            final_t = (t_sg, u_sg)
 
         if return_arg:
             return min_dists, final_t
@@ -1628,9 +1670,15 @@ class JaxSpline:
         :param curve_points: N_cxD array of curve points
         :return: N_p array of indices of closest curve points
         '''
-        dists = jnp.linalg.norm(curve_points[:, None] - points[None], axis=-1)
+        # dists = jnp.linalg.norm(curve_points[:, None] - points[None], axis=-1)
+        dists = JaxSpline._safe_2norm(curve_points[:, None] - points[None], eps=1e-12)
         closest_indices = jnp.argmin(dists, axis=0)
         return closest_indices
+    
+    @staticmethod
+    @partial(jax.jit, static_argnames=['keep_dims'])
+    def _safe_2norm(x, eps=1e-12, keep_dims=False):
+        return jnp.sqrt(jnp.sum(x * x, axis=-1, keepdims=keep_dims) + eps)
     
     def _find_closest_ribbon_point(
         self,
@@ -1647,9 +1695,6 @@ class JaxSpline:
         self._check_control_points_are_set()
         if not self.is_ribbon:
             raise RuntimeError("_find_closest_ribbon_point only valid for ribbons.")
-        if self._frame_cache is None:
-            # Ensure cache exists (you already build it in control_points setter)
-            self._frame_cache = self._compute_dense_bishop_frames()
 
         # Ensure shapes
         if points.ndim == 1:
@@ -1659,8 +1704,8 @@ class JaxSpline:
 
         pos_cp = self._pos_control_points()
         th_cp = self._theta_control_points()
-        frame_cache = self._frame_cache
-        w = float(self.ribbon_width)
+        frame_cache = self.frame_cache
+        w = self.ribbon_width
 
         # 1) optimize t
         t_final = JaxSpline._find_closest_ribbon_point_projected_newton_t(
@@ -1688,6 +1733,7 @@ class JaxSpline:
 
         u_final = jax.vmap(closest_for_one)(t_final, points)  # (N,)
         return t_final, u_final
+    
     @staticmethod
     @partial(jax.jit, static_argnames=['M', 'half_support', 'closed', 'max_iters', 'max_step'])
     def _find_closest_ribbon_point_projected_newton_t(
@@ -1704,6 +1750,7 @@ class JaxSpline:
         Run several projected Newton steps on t (batched).
         Returns final t (N,).
         """
+        print(f"JIT compiling _find_closest_ribbon_point_projected_newton_t")
 
         t_inits = jnp.atleast_1d(t_inits) # (N,)
         points = jnp.atleast_2d(points) # (N,3) even for single point
@@ -1761,12 +1808,18 @@ class JaxSpline:
             ribbon_width,
             M, half_support, pad, closed
         )
+        
+        # --- ROBUSTNESS BLOCK ---
+        # 1. Handle non-finite gradients (NaN/Inf protection)
+        # If g or h is NaN, we zero out the step to prevent polluting the model parameters.
+        is_valid = jnp.isfinite(g) & jnp.isfinite(h)
 
         # Make a robust step:
         # - If h is tiny/negative (can happen near clip kinks), fall back to a damped step.
         # - Also cap step magnitude.
         eps = 1e-8
         denom = jnp.where(jnp.abs(h) > eps, h, jnp.sign(h) * eps + (h == 0.0) * eps)
+
         step_newton = -g / denom
 
         # If curvature is "bad" (negative Hessian), do a small gradient step instead.
@@ -1774,6 +1827,8 @@ class JaxSpline:
         step = jnp.where(h > eps, step_newton, step_gd)
 
         step = jnp.clip(step, -max_step, max_step)
+        step = jnp.where(is_valid, step, 0.0)
+        
         t_new = t + step
 
         # Projection (bounds or periodic)
@@ -1784,6 +1839,7 @@ class JaxSpline:
             t_new
         )
         return t_new
+    
     @staticmethod
     @partial(jax.jit, static_argnames=['M', 'half_support', 'closed'])
     def _ribbon_dist2_scalar(
@@ -1818,12 +1874,13 @@ class JaxSpline:
           - return closest point on ribbon at that t and dist^2.
         This is the scalar building block used by Newton in t.
         """
+        print("JIT compiling _ribbon_closest_point_given_t")
         # Keep t in-domain in a way that's JIT-friendly.
         # For closed, use periodic wrap; for open, clip.
         t = lax.cond(
             closed,
             lambda x: jnp.mod(x, M),
-            lambda x: jnp.clip(x, 0.0, float(M - 1e-6)),
+            lambda x: jnp.clip(x, 0.0, jnp.asarray(float(M - 1e-6), dtype=jnp.float32)),
             t
         )
 
@@ -1832,7 +1889,11 @@ class JaxSpline:
         th = JaxSpline._theta_bounded(t, theta_control_points, M, half_support, pad, closed)[0]  # ()
 
         # Width direction at scalar t (needs cached frame)
-        d = JaxSpline._ribbon_width_dir(jnp.array([t]), jnp.array([th]), frame_cache, closed=closed, M=M)[0]  # (3,)
+        d = JaxSpline._ribbon_width_dir(jnp.array([t], dtype=jnp.float32), jnp.array([th], dtype=jnp.float32), frame_cache, closed=closed, M=M)[0]  # (3,)
+        
+        c = jnp.nan_to_num(c)
+        th = jnp.nan_to_num(th)
+        d = jnp.nan_to_num(d)
 
         half_w = 0.5 * ribbon_width
         v = point - c
@@ -2117,9 +2178,9 @@ def _prepared_dict_for_constructor(data):
     data["closed"] = data["closed"] in true_strings
 
     if "control_points" in data:
-        data["control_points"] = jnp.array(data["control_points"])
+        data["control_points"] = jnp.array(data["control_points"], dtype=jnp.float32)
     if "tangents" in data:
-        data["tangents"] = jnp.array(data["tangents"])
+        data["tangents"] = jnp.array(data["tangents"], dtype=jnp.float32)
 
     # The version of the json file is only required for parsing
     del data["version"]
@@ -2227,3 +2288,5 @@ def splines_from_json(path):
             splines.append(JaxSpline(**spline_data))
 
     return splines
+
+# %%
