@@ -1388,6 +1388,14 @@ class JaxSpline:
             raise RuntimeError("Ribbon width vector only defined when is_ribbon=True.")
         
         t_arr, single_val = self._convert_to_array(t)
+
+        if frame == "bishop" and initial_vector is None:
+            # JIT reconstructs this pytree without _frame_cache. Rebuild the
+            # global frames, never transport along the (possibly clustered or
+            # repeated) queries: distance's closest-point search uses this same
+            # global frame field, and its final surface must agree with it.
+            d = self._ribbon_width_dir(t_arr, self.theta(t_arr), self.frame_cache, self.closed, self.M)
+            return d[0] if single_val else d
         
         frames = self.moving_frame(t_arr, method=frame, initial_vector=initial_vector)
         N = frames[:, 1, :]
